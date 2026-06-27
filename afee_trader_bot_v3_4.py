@@ -1074,26 +1074,29 @@ async def get_top_symbols(session: aiohttp.ClientSession, n: int = 100) -> list[
     return [d["symbol"] for d in usdt[:n]]
 
 # ─── SYMBOL QUALITY RANKING (مورد ۶) ───────────────────────────────────────────
-async def get_symbol_spread_quality(session: aiohttp.ClientSession, symbol: str) -> float:
-    """
-    کیفیت اسپرد: فاصله bid/ask نسبت به قیمت میانی. هرچه اسپرد کمتر (نسبت به قیمت)،
-    کیفیت بالاتر. خروجی بین ۰ تا ۱ (۱ = بهترین، اسپرد نزدیک صفر).
-    """
+async def get_symbol_spread_quality(session, symbol):
     try:
         url = f"{BINANCE_BASE}/ticker/bookTicker"
-        async with session.get(url, params={"symbol": symbol}, proxy=PROXY,
-                               timeout=aiohttp.ClientTimeout(total=8)) as r:
-            data = await r.json()
-        bid, ask = float(data["bidPrice"]), float(data["askPrice"])
-        mid = (bid + ask) / 2
-        if mid == 0:
-            return 0.5
-        spread_pct = (ask - bid) / mid * 100
-        # نرمال‌سازی: اسپرد ۰٪ → امتیاز ۱.۰  |  اسپرد ۰.5٪ یا بیشتر → امتیاز ۰.۰
-        return max(0.0, min(1.0, 1.0 - (spread_pct / 0.5)))
-    except Exception:
-        return 0.3  # در صورت خطا، امتیاز محافظه‌کارانه پایین (نه صفر، نه کامل)
 
+        async with session.get(url, params={"symbol": symbol}, proxy=PROXY) as r:
+            data = await r.json()
+
+        if not isinstance(data, dict):
+            return 0.3
+
+        bid = float(data.get("bidPrice", 0))
+        ask = float(data.get("askPrice", 0))
+
+        if bid == 0 or ask == 0:
+            return 0.3
+
+        mid = (bid + ask) / 2
+        spread_pct = (ask - bid) / mid * 100
+
+        return max(0.0, min(1.0, 1.0 - (spread_pct / 0.5)))
+
+    except:
+        return 0.3
 def calc_structure_cleanliness(candles: list[dict]) -> float:
     """
     نظم ساختاری بازار: تعداد سطوح S/R معتبر (با حداقل ۲ برخورد) که در داده تشخیص داده می‌شود.
