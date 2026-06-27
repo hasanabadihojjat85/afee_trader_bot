@@ -1064,39 +1064,40 @@ async def get_top_symbols(session: aiohttp.ClientSession, n: int = 100) -> list[
     url = f"{BINANCE_BASE}/ticker/24hr"
     async with session.get(url, proxy=PROXY, timeout=aiohttp.ClientTimeout(total=15)) as r:
         data = await r.json()
+    # اگر Binance خطا برگرداند (dict با "code" و "msg")، list نیست → raise کن تا caller لاگ کند
+    if not isinstance(data, list):
+        raise ValueError(f"Binance /ticker/24hr unexpected response: {data}")
     usdt = [
         d for d in data
-        if d["symbol"].endswith("USDT")
-        and not any(d["symbol"].startswith(s) for s in STABLE)
-        and float(d["quoteVolume"]) > 0
+        if isinstance(d, dict)
+        and d.get("symbol", "").endswith("USDT")
+        and not any(d.get("symbol", "").startswith(s) for s in STABLE)
+        and float(d.get("quoteVolume", 0)) > 0
     ]
     usdt.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
     return [d["symbol"] for d in usdt[:n]]
 
 # ─── SYMBOL QUALITY RANKING (مورد ۶) ───────────────────────────────────────────
-async def get_symbol_spread_quality(session, symbol):
+async def get_symbol_spread_quality(session: aiohttp.ClientSession, symbol: str) -> float:
+    """
+    کیفیت اسپرد: فاصله bid/ask نسبت به قیمت میانی. هرچه اسپرد کمتر (نسبت به قیمت)،
+    کیفیت بالاتر. خروجی بین ۰ تا ۱ (۱ = بهترین، اسپرد نزدیک صفر).
+    """
     try:
         url = f"{BINANCE_BASE}/ticker/bookTicker"
-
-        async with session.get(url, params={"symbol": symbol}, proxy=PROXY) as r:
+        async with session.get(url, params={"symbol": symbol}, proxy=PROXY,
+                               timeout=aiohttp.ClientTimeout(total=8)) as r:
             data = await r.json()
-
-        if not isinstance(data, dict):
-            return 0.3
-
-        bid = float(data.get("bidPrice", 0))
-        ask = float(data.get("askPrice", 0))
-
-        if bid == 0 or ask == 0:
-            return 0.3
-
+        bid, ask = float(data["bidPrice"]), float(data["askPrice"])
         mid = (bid + ask) / 2
+        if mid == 0:
+            return 0.5
         spread_pct = (ask - bid) / mid * 100
-
+        # نرمال‌سازی: اسپرد ۰٪ → امتیاز ۱.۰  |  اسپرد ۰.5٪ یا بیشتر → امتیاز ۰.۰
         return max(0.0, min(1.0, 1.0 - (spread_pct / 0.5)))
+    except Exception:
+        return 0.3  # در صورت خطا، امتیاز محافظه‌کارانه پایین (نه صفر، نه کامل)
 
-    except:
-        return 0.3
 def calc_structure_cleanliness(candles: list[dict]) -> float:
     """
     نظم ساختاری بازار: تعداد سطوح S/R معتبر (با حداقل ۲ برخورد) که در داده تشخیص داده می‌شود.
@@ -1211,6 +1212,9 @@ async def get_candles(
     try:
         async with session.get(url, params=params, proxy=PROXY, timeout=aiohttp.ClientTimeout(total=10)) as r:
             raw = await r.json()
+        if not isinstance(raw, list):
+            log.debug(f"Candle fetch bad response {symbol} {interval}: {raw}")
+            return []
         candles = []
         for k in raw:
             candles.append({
@@ -4694,4 +4698,3 @@ if __name__ == "__main__":
             print("Commands: blacklist <SYM> | show-blacklist | remove-blacklist <SYM>")
     else:
         asyncio.run(main())
-
