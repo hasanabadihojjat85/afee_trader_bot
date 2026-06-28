@@ -22,7 +22,7 @@ import base64
 BOT_VERSION = "3.4.0"
 TELEGRAM_TOKEN = "7166787350:AAGFiTzSYxj3f7729czsqTzO3Fiwe1pimQw"
 TELEGRAM_CHAT_ID = "-1002532379243"
-BINANCE_BASE = "https://api.binance.com/api/v3"
+BINANCE_BASE = "https://fapi.binance.com/fapi/v1"  # Futures API (USDT-M Perpetual)
 
 # Timeframe map  (Binance interval string)
 TF = {
@@ -49,8 +49,8 @@ ADX_THRESHOLD_DEFAULT     = 25.0
 ATR_MULTIPLIER_DEFAULT    = 2.2
 SESSION_FILTERS_DEFAULT   = {"london": True, "ny": True, "asian": True}
 
-# ─── PROXY (Hiddify Mixed Port) ───────────────────────────────────────────────
-PROXY = None  # disabled on cloud
+# ─── PROXY ────────────────────────────────────────────────────────────────────
+PROXY = None  # Railway: no proxy needed (direct internet access)
 
 # ─── LOGGING (UTF-8 safe for Windows CMD) ────────────────────────────────────
 import sys
@@ -427,6 +427,10 @@ async def update_trade_outcomes(session: aiohttp.ClientSession):
                 async with session.get(url, params={"symbol": row["symbol"]}, proxy=PROXY,
                                        timeout=aiohttp.ClientTimeout(total=10)) as r:
                     data = await r.json()
+                # Futures ticker/price returns {"symbol":...,"price":...}
+                if not isinstance(data, dict) or "price" not in data:
+                    log.debug(f"Unexpected price response for {row['symbol']}: {data}")
+                    continue
                 current_price = float(data["price"])
             except Exception as e:
                 log.debug(f"Price fetch failed for {row['symbol']}: {e}")
@@ -1018,6 +1022,7 @@ def build_message(
     score: int,
     rsi: Optional[float] = None,
     market_regime: Optional[str] = None,
+    tp2_potential: int = None,
 ) -> str:
     now_utc = datetime.now(timezone.utc)
     time_str = now_utc.strftime("%Y-%m-%d %H:%M UTC")
@@ -1031,6 +1036,13 @@ def build_message(
     def fmt(v): return f"{v:.{decimals}f}"
 
     rsi_line = f"📐 <b>RSI:</b> {rsi}\n" if rsi is not None else ""
+    tp2_line = ""
+    if tp2_potential is not None:
+        if tp2_potential >= TP2_POTENTIAL_THRESHOLD:
+            tp2_stars = "🚀" if tp2_potential >= 80 else "⚡️"
+            tp2_line = f"{tp2_stars} <b>TP2 Potential:</b> {tp2_potential}/100 — احتمال بالای رسیدن به TP2\n"
+        else:
+            tp2_line = f"🎯 <b>TP2 Potential:</b> {tp2_potential}/100\n"
     regime_line = f"🌐 <b>Market Regime:</b> {market_regime}\n" if market_regime else ""
 
     msg = (
@@ -1047,6 +1059,7 @@ def build_message(
         f"🛑 <b>Stop:</b> {fmt(stop)}\n"
         f"🎯 <b>TP1:</b> {fmt(tp1)} (1.5R)\n"
         f"🎯 <b>TP2:</b> {fmt(tp2)} (3R)\n"
+        f"{tp2_line}"
         f"⭐️ <b>Signal Score:</b> {score}/100\n"
         f"🕒 <b>Time:</b> {time_str}\n"
         f"━━━━━━━━━━━━━━━\n"
@@ -1059,23 +1072,30 @@ def build_message(
 
 # ─── BINANCE DATA ─────────────────────────────────────────────────────────────
 async def get_top_symbols(session: aiohttp.ClientSession, n: int = 100) -> list[str]:
-    """Return top N USDT pairs by 24h quote volume, excluding stablecoins."""
-    STABLE = {"USDC", "BUSD", "TUSD", "DAI", "FDUSD", "USDP", "USDD"}
+    """Return top N USDT perpetual futures pairs by 24h quote volume, excluding stablecoins.
+    Uses Binance Futures API (fapi/v1). Symbols are plain BTCUSDT format
+    (Binance REST does NOT use .P suffix; .P is a TradingView convention only).
+    """
+    STABLE = {"USDC", "BUSD", "TUSD", "DAI", "FDUSD", "USDP", "USDD", "USDT"}
     url = f"{BINANCE_BASE}/ticker/24hr"
-    async with session.get(url, proxy=PROXY, timeout=aiohttp.ClientTimeout(total=15)) as r:
-        data = await r.json()
-    # اگر Binance خطا برگرداند (dict با "code" و "msg")، list نیست → raise کن تا caller لاگ کند
-    if not isinstance(data, list):
-        raise ValueError(f"Binance /ticker/24hr unexpected response: {data}")
-    usdt = [
-        d for d in data
-        if isinstance(d, dict)
-        and d.get("symbol", "").endswith("USDT")
-        and not any(d.get("symbol", "").startswith(s) for s in STABLE)
-        and float(d.get("quoteVolume", 0)) > 0
-    ]
-    usdt.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
-    return [d["symbol"] for d in usdt[:n]]
+    try:
+        async with session.get(url, proxy=PROXY, timeout=aiohttp.ClientTimeout(total=15)) as r:
+            data = await r.json()
+        if not isinstance(data, list):
+            log.error(f"Unexpected /ticker/24hr response type: {type(data)} — {str(data)[:200]}")
+            return []
+        usdt = [
+            d for d in data
+            if isinstance(d, dict)
+            and d.get("symbol", "").endswith("USDT")
+            and not any(d.get("symbol", "").startswith(s) for s in STABLE)
+            and float(d.get("quoteVolume", 0) or 0) > 0
+        ]
+        usdt.sort(key=lambda x: float(x.get("quoteVolume", 0) or 0), reverse=True)
+        return [d["symbol"] for d in usdt[:n]]
+    except Exception as e:
+        log.error(f"get_top_symbols failed: {e}")
+        return []
 
 # ─── SYMBOL QUALITY RANKING (مورد ۶) ───────────────────────────────────────────
 async def get_symbol_spread_quality(session: aiohttp.ClientSession, symbol: str) -> float:
@@ -1084,10 +1104,13 @@ async def get_symbol_spread_quality(session: aiohttp.ClientSession, symbol: str)
     کیفیت بالاتر. خروجی بین ۰ تا ۱ (۱ = بهترین، اسپرد نزدیک صفر).
     """
     try:
+        # Futures API: /fapi/v1/ticker/bookTicker — same field names as spot
         url = f"{BINANCE_BASE}/ticker/bookTicker"
         async with session.get(url, params={"symbol": symbol}, proxy=PROXY,
                                timeout=aiohttp.ClientTimeout(total=8)) as r:
             data = await r.json()
+        if not isinstance(data, dict) or "bidPrice" not in data:
+            return 0.3
         bid, ask = float(data["bidPrice"]), float(data["askPrice"])
         mid = (bid + ask) / 2
         if mid == 0:
@@ -1212,9 +1235,6 @@ async def get_candles(
     try:
         async with session.get(url, params=params, proxy=PROXY, timeout=aiohttp.ClientTimeout(total=10)) as r:
             raw = await r.json()
-        if not isinstance(raw, list):
-            log.debug(f"Candle fetch bad response {symbol} {interval}: {raw}")
-            return []
         candles = []
         for k in raw:
             candles.append({
@@ -2248,6 +2268,101 @@ async def strategy_trigger_fib(
                 }
     return None
 
+# ─── TP2 POTENTIAL DETECTOR ────────────────────────────────────────────────────
+def calc_tp2_potential_score(candles_1h: list, candles_4h: list, direction: str) -> int:
+    """
+    امتیاز پتانسیل رسیدن به TP2 (۰ تا ۱۰۰) بر اساس چند عامل کلیدی:
+    ۱. عمق حرکت: آیا بازار در گذشته حرکت‌های بزرگ ≥3R داشته؟
+    ۲. ساختار موج: آیا موج‌های ایمپالس قوی با pullback کم وجود دارد؟
+    ۳. momentum قوی در تایم ۴ ساعته: EMA شیب‌دار + حجم بالا
+    ۴. فضای باز تا ناحیه مقاومت/حمایت بعدی (فاصله کافی برای رسیدن به TP2)
+
+    سیگنال‌هایی که امتیاز TP2 Potential بالایی دارند در پیام تلگرام با تگ 🚀 نشان داده می‌شوند.
+    """
+    if not candles_1h or len(candles_1h) < 50:
+        return 50  # default mid
+
+    score = 0
+
+    # ── ۱. بررسی حرکت‌های بزرگ در گذشته (momentum history) ──
+    closes_1h = [c["close"] for c in candles_1h]
+    # آیا در ۵۰ کندل گذشته، حرکتی بیش از ۳٪ در ۱۰ کندل پیدا می‌کنیم؟
+    big_moves = 0
+    for i in range(10, len(closes_1h)):
+        move_pct = abs(closes_1h[i] - closes_1h[i-10]) / closes_1h[i-10] * 100
+        if move_pct >= 3.0:
+            big_moves += 1
+    if big_moves >= 5:
+        score += 25
+    elif big_moves >= 2:
+        score += 15
+    elif big_moves >= 1:
+        score += 8
+
+    # ── ۲. Momentum: RSI در ناحیه قوی (نه اشباع) ──
+    rsis = calc_rsi(closes_1h, 14)
+    rsi_now = next((r for r in reversed(rsis) if r is not None), None)
+    if rsi_now is not None:
+        if direction == "BUY" and 50 <= rsi_now <= 70:
+            score += 20  # روند صعودی قوی بدون اشباع
+        elif direction == "SELL" and 30 <= rsi_now <= 50:
+            score += 20
+        elif direction == "BUY" and 45 <= rsi_now < 50:
+            score += 10
+        elif direction == "SELL" and 50 < rsi_now <= 55:
+            score += 10
+
+    # ── ۳. شیب EMA200 همسو با سیگنال ──
+    ema_slope = calc_ema200_slope(closes_1h)
+    if (direction == "BUY" and ema_slope == "UP") or (direction == "SELL" and ema_slope == "DOWN"):
+        score += 20
+    elif ema_slope == "FLAT":
+        score += 8
+
+    # ── ۴. فضای باز: ناحیه S/R بعدی در فاصله کافی ──
+    if candles_4h and len(candles_4h) >= 20:
+        scored_4h = find_sr_levels_scored(candles_4h)
+        price = closes_1h[-1]
+        if scored_4h:
+            if direction == "BUY":
+                resistances = [sl["price"] for sl in scored_4h if sl["price"] > price]
+                if resistances:
+                    nearest_res = min(resistances)
+                    space_pct = (nearest_res - price) / price * 100
+                    if space_pct >= 4.0:
+                        score += 25  # فضای زیاد تا مقاومت بعدی
+                    elif space_pct >= 2.5:
+                        score += 15
+                    elif space_pct >= 1.5:
+                        score += 8
+                else:
+                    score += 20  # هیچ مقاومتی بالاتر نیست — فضای کاملاً باز
+            else:
+                supports = [sl["price"] for sl in scored_4h if sl["price"] < price]
+                if supports:
+                    nearest_sup = max(supports)
+                    space_pct = (price - nearest_sup) / price * 100
+                    if space_pct >= 4.0:
+                        score += 25
+                    elif space_pct >= 2.5:
+                        score += 15
+                    elif space_pct >= 1.5:
+                        score += 8
+                else:
+                    score += 20
+
+    # ── ۵. ADX قوی (روند واضح) ──
+    adx = calc_adx(candles_1h[-50:] if len(candles_1h) >= 50 else candles_1h, 14)
+    if adx >= 35:
+        score += 10
+    elif adx >= 25:
+        score += 5
+
+    return min(100, score)
+
+
+TP2_POTENTIAL_THRESHOLD = 65  # امتیاز بالاتر از این → سیگنال با 🚀 نشان داده می‌شود
+
 # ─── COOLDOWN TRACKER ─────────────────────────────────────────────────────────
 _last_signal: dict[str, float] = {}   # key: "symbol_strategy_direction" → timestamp
 _filter_cooldown: dict[str, float] = {}  # Patch #8/#13: symbol → time when filter cooldown expires
@@ -2969,6 +3084,8 @@ async def _run_backtest_job(session, job: dict) -> dict:
         all_trades = []
 
     log.info(f"BT job {job_id}: {len(all_trades)} closed trades found in last {timerange}h")
+    if not all_trades:
+        log.info(f"BT job {job_id}: No closed trades in DB for last {timerange}h — backtest result will be empty")
 
     # ── Summary ──
     wins      = [t for t in all_trades if t.get("outcome") in ("TP1", "TP1_TOUCHSL", "TP2")]
@@ -3204,7 +3321,7 @@ async def normalize_and_validate_symbol(session, raw_text: str) -> Optional[str]
             if r.status != 200:
                 return None
             data = await r.json()
-            if "price" not in data:
+            if not isinstance(data, dict) or "price" not in data:
                 return None
     except Exception:
         return None
@@ -3258,7 +3375,10 @@ async def analyze_symbol_manually(session, symbol: str, state: dict = None) -> s
         async with session.get(url, params={"symbol": symbol}, proxy=PROXY,
                                timeout=aiohttp.ClientTimeout(total=10)) as r:
             price_data = await r.json()
-        current_price = float(price_data["price"])
+        if isinstance(price_data, dict) and "price" in price_data:
+            current_price = float(price_data["price"])
+        else:
+            current_price = None
     except Exception:
         current_price = None
 
@@ -4503,6 +4623,15 @@ async def scan_symbol(session, symbol, semaphore, state, open_keys):
                     log.info(f"POST-FILTER SCORE DROP: {symbol} | {strat_name} | score={_final_score} < min={_min_required} → blocked")
                     continue
 
+                # ── TP2 Potential Score ──
+                try:
+                    c1h_tp2 = await get_candles(session, symbol, "1h", 100)
+                    c4h_tp2 = await get_candles(session, symbol, "4h", 80)
+                    tp2_pot = calc_tp2_potential_score(c1h_tp2, c4h_tp2, result["direction"])
+                    result["tp2_potential"] = tp2_pot
+                except Exception:
+                    result["tp2_potential"] = 50
+
                 results.append(result)
             except Exception as e:
                 log.debug(f"Error {strat_name} {symbol}: {e}")
@@ -4571,6 +4700,7 @@ async def scan_once(session, state):
                 tp1=result["tp1"], tp2=result["tp2"],
                 timeframe=result["timeframe"], score=result["score"],
                 rsi=result.get("rsi"), market_regime=result.get("market_regime"),
+                tp2_potential=result.get("tp2_potential"),
             ), state)
             signals_sent += 1
             await asyncio.sleep(5)  # جلوگیری از Rate Limit تلگرام: حداقل ۵ ثانیه فاصله بین هر سیگنال
@@ -4628,7 +4758,13 @@ async def main():
                     if state.get("last_report_date") != today_iran_str and now_iran.hour == 0:
                         log.info("Generating daily report...")
                         trades = await update_trade_outcomes(session)
+                        # FIX v3.5: گزارش بر اساس روز UTC (همان مبنای closed_at در DB)
+                        # نه روز ایران — تا ارقام گزارش با دیتابیس مطابقت داشته باشد
                         report_date_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                        # اگر ساعت ۰۰:۰۰ ایران باشد، UTC احتمالاً هنوز روز قبل است (۲۰:۳۰ UTC)
+                        # پس گزارش روز قبلِ UTC را می‌سازیم (همان روزی که معاملات بسته شدند)
+                        from datetime import timedelta
+                        report_date_utc = (datetime.now(timezone.utc) - timedelta(hours=4)).strftime("%Y-%m-%d")
                         report_text = build_daily_report(trades, report_date_utc)
                         await broadcast_signal(session, report_text, state)
                         state["last_report_date"] = today_iran_str
@@ -4698,3 +4834,4 @@ if __name__ == "__main__":
             print("Commands: blacklist <SYM> | show-blacklist | remove-blacklist <SYM>")
     else:
         asyncio.run(main())
+
