@@ -1,1 +1,1 @@
-web: python afee_trader_bot_v3_5.py
+web: python afee_trader_bot_v3_7.py
