@@ -5402,4 +5402,3 @@ if __name__ == "__main__":
             print("Commands: blacklist <SYM> | show-blacklist | remove-blacklist <SYM>")
     else:
         asyncio.run(main())
-
