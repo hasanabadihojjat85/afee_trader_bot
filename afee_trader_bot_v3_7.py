@@ -20,7 +20,7 @@ import base64
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 BOT_VERSION = "3.7.0"
-TELEGRAM_TOKEN = "7166787350:AAGFiTzSYxj3f7729czsqTzO3Fiwe1pimQw"
+TELEGRAM_TOKEN = "7166787350:AAH-Uw-a-kGOq1CJT7GmjcfX3CAUQigO0ms"
 TELEGRAM_CHAT_ID = "-1002532379243"
 BINANCE_BASE = "https://fapi.binance.com/fapi/v1"  # Futures API (USDT-M Perpetual)
 
